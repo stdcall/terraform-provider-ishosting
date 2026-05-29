@@ -3,7 +3,9 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	crypt "crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -174,7 +176,7 @@ type VPS struct {
 		} `json:"config"`
 	} `json:"platform"`
 	Network struct {
-		PublicIP   string `json:"public_ip"`
+		PublicIP  string `json:"public_ip"`
 		Protocols struct {
 			IPv4 []IPAddress `json:"ipv4"`
 			IPv6 []IPAddress `json:"ipv6"`
@@ -259,17 +261,20 @@ func (c *Client) UpdateVPS(ctx context.Context, id string, req VPSPatchRequest) 
 // --- Order Operations ---
 
 // OrderItem represents an item in an order.
+//
+// The plan code fully determines the location, billing period and base
+// hardware (the API derives location from the plan code, so there is no
+// separate location field). Use Additions to customise OS, RAM, drive,
+// extra IPs, control panel, etc.
 type OrderItem struct {
-	Action   string `json:"action"`
-	Type     string `json:"type"`
-	Plan     string `json:"plan"`
-	Location struct {
-		City string `json:"city"`
-	} `json:"location"`
-	Quantity  int              `json:"quantity"`
-	Options   *OrderOptions    `json:"options,omitempty"`
-	Additions []OrderAddition  `json:"additions,omitempty"`
-	Comment   string           `json:"comment,omitempty"`
+	Action    string          `json:"action"`
+	Identity  string          `json:"identity,omitempty"`
+	Type      string          `json:"type"`
+	Plan      string          `json:"plan"`
+	Quantity  int             `json:"quantity"`
+	Options   *OrderOptions   `json:"options,omitempty"`
+	Additions []OrderAddition `json:"additions,omitempty"`
+	Comment   string          `json:"comment,omitempty"`
 }
 
 type OrderOptions struct {
@@ -286,14 +291,25 @@ type OrderSSH struct {
 	Keys      []string `json:"keys,omitempty"`
 }
 
+// OrderAddition represents a plan add-on. Most add-ons are selected by Code
+// (e.g. {"code":"2g","category":"ram"} or {"code":"linux/ubuntu24#64","category":"os"}),
+// while quantity-based add-ons such as extra IPs use Quantity
+// (e.g. {"quantity":2,"category":"ip"}). Valid category/code values come from
+// the /vps/configs/{plan} endpoint.
 type OrderAddition struct {
-	Code     string          `json:"code,omitempty"`
-	Category string          `json:"category"`
-	Variant  *OrderVariant   `json:"variant,omitempty"`
+	Code     string `json:"code,omitempty"`
+	Category string `json:"category"`
+	Quantity *int   `json:"quantity,omitempty"`
 }
 
-type OrderVariant struct {
-	Lang string `json:"lang,omitempty"`
+// NewOrderIdentity returns a random 16-character hex identity used to correlate
+// an order item within a multi-item order, matching the official API client.
+func NewOrderIdentity() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%016x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 type OrderRequest struct {
@@ -302,11 +318,11 @@ type OrderRequest struct {
 }
 
 type InvoiceResponse struct {
-	ID       json.Number `json:"id"`
-	Cipher   string      `json:"cipher"`
-	Status   struct {
-		Name    string `json:"name"`
-		Code    string `json:"code"`
+	ID     json.Number `json:"id"`
+	Cipher string      `json:"cipher"`
+	Status struct {
+		Name string `json:"name"`
+		Code string `json:"code"`
 	} `json:"status"`
 	Services []struct {
 		Action  string `json:"action"`
@@ -517,56 +533,71 @@ func (c *Client) GetVPSIPs(ctx context.Context, vpsID string) ([]IPAddress, []IP
 
 // --- Plans & Configs ---
 
+// VPSPlanConfigItem is a hardware/OS component of a plan. The API returns these
+// as value/name/code triples (e.g. RAM {value:"1GB", name:"1 Gb", code:"1g"}).
+type VPSPlanConfigItem struct {
+	Value string `json:"value"`
+	Name  string `json:"name"`
+	Code  string `json:"code"`
+}
+
+// VPSPlanPeriod is one of the available billing periods for a plan, each mapping
+// to its own plan code (e.g. {code:"1y", plan:"791_1y", price:"71.3$"}).
+type VPSPlanPeriod struct {
+	Name  string `json:"name"`
+	Code  string `json:"code"`
+	Plan  string `json:"plan"`
+	Price string `json:"price"`
+}
+
+// VPSPlan represents a single entry from /vps/plans. Note the API returns a bare
+// JSON array of these objects (no "data" wrapper), prices are strings like
+// "6.99$", and the period is an object rather than a bare string.
 type VPSPlan struct {
-	Name     string  `json:"name"`
-	Code     string  `json:"code"`
-	Price    float64 `json:"price"`
-	Period   string  `json:"period"`
-	Location struct {
-		Name    string `json:"name"`
-		Code    string `json:"code"`
-		Variant struct {
+	Plan struct {
+		Name        string `json:"name"`
+		Code        string `json:"code"`
+		Description string `json:"description"`
+		Price       string `json:"price"`
+		Category    struct {
 			Name string `json:"name"`
 			Code string `json:"code"`
-		} `json:"variant"`
+		} `json:"category"`
+		Period struct {
+			Name string `json:"name"`
+			Code string `json:"code"`
+		} `json:"period"`
+	} `json:"plan"`
+	Location struct {
+		Name string `json:"name"`
+		Code string `json:"code"`
 	} `json:"location"`
 	Platform struct {
 		Name   string `json:"name"`
 		Code   string `json:"code"`
 		Config struct {
-			CPU struct {
-				Cores int    `json:"cores"`
-				Name  string `json:"name"`
-			} `json:"cpu"`
-			RAM struct {
-				Size int    `json:"size"`
-				Unit string `json:"unit"`
-			} `json:"ram"`
-			Drive struct {
-				Size int    `json:"size"`
-				Unit string `json:"unit"`
-				Type string `json:"type"`
-			} `json:"drive"`
+			CPU   VPSPlanConfigItem `json:"cpu"`
+			RAM   VPSPlanConfigItem `json:"ram"`
+			Drive VPSPlanConfigItem `json:"drive"`
+			OS    VPSPlanConfigItem `json:"os"`
 		} `json:"config"`
 	} `json:"platform"`
+	Periods []VPSPlanPeriod `json:"periods"`
 }
 
-type VPSPlansResponse struct {
-	Data []VPSPlan `json:"data"`
-}
-
-type VPSPlanResponse struct {
-	Data VPSPlan `json:"data"`
-}
-
-// ListVPSPlans lists available VPS plans.
+// ListVPSPlans lists available VPS plans, optionally filtered by location and/or
+// platform codes. Filters use repeated "locations"/"platforms" query parameters
+// (the older "locations[]" bracket form is silently ignored by the API).
 func (c *Client) ListVPSPlans(ctx context.Context, locations, platforms []string) ([]VPSPlan, error) {
 	query := url.Values{}
 	for _, l := range locations {
-		query.Add("locations[]", l)
+		query.Add("locations", l)
 	}
 	for _, p := range platforms {
-		query.Add("platforms[]", p)
+		query.Add("platforms", p)
+	}
+	if len(query) == 0 {
+		query = nil
 	}
 
 	respBody, err := c.doRequest(ctx, http.MethodGet, "/vps/plans", nil, query)
@@ -574,30 +605,42 @@ func (c *Client) ListVPSPlans(ctx context.Context, locations, platforms []string
 		return nil, err
 	}
 
-	var resp VPSPlansResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
+	var plans []VPSPlan
+	if err := json.Unmarshal(respBody, &plans); err != nil {
 		return nil, fmt.Errorf("unmarshaling VPS plans response: %w", err)
 	}
 
-	return resp.Data, nil
+	return plans, nil
 }
 
-// VPSConfigsResponse represents available configuration options for a plan.
-type VPSConfigsResponse struct {
-	Data json.RawMessage `json:"data"`
+// VPSConfigLocation maps a country to the plan code that provisions a plan in
+// that country, as returned in the "locations" array of /vps/configs/{plan}.
+type VPSConfigLocation struct {
+	Name  string `json:"name"`
+	Code  string `json:"code"`
+	Plan  string `json:"plan"`
+	Price string `json:"price"`
 }
 
-// GetVPSConfigs retrieves available configurations for a plan code.
+// GetVPSConfigs retrieves available configuration options for a plan code. The
+// API returns a top-level object (periods, locations, platforms, network,
+// security, tools), which is returned here verbatim as raw JSON.
 func (c *Client) GetVPSConfigs(ctx context.Context, planCode string) (json.RawMessage, error) {
 	respBody, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/vps/configs/%s", planCode), nil, nil)
 	if err != nil {
 		return nil, err
 	}
+	return json.RawMessage(respBody), nil
+}
 
-	var resp VPSConfigsResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshaling VPS configs response: %w", err)
+// ParseConfigLocations extracts the per-country plan codes from a raw configs
+// response (the "locations" array).
+func ParseConfigLocations(raw json.RawMessage) ([]VPSConfigLocation, error) {
+	var parsed struct {
+		Locations []VPSConfigLocation `json:"locations"`
 	}
-
-	return resp.Data, nil
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("parsing VPS configs locations: %w", err)
+	}
+	return parsed.Locations, nil
 }

@@ -17,8 +17,8 @@ Lists available ISHosting VPS plans.
 
 ### Optional
 
-- `locations` (List of String) Filter by location codes.
-- `platforms` (List of String) Filter by platform codes.
+- `locations` (List of String) Filter by ISO country codes (e.g. ["NL", "DE"]). Each plan is tied to a single country.
+- `platforms` (List of String) Filter by platform codes (e.g. ["linux"]).
 
 ### Read-Only
 
@@ -29,19 +29,16 @@ Lists available ISHosting VPS plans.
 
 Read-Only:
 
-- `city_code` (String) City code (use this as the location in the ishosting_vps resource).
-- `city_name` (String) City name.
-- `code` (String) Plan code (use this in the ishosting_vps resource).
-- `cpu_cores` (Number) Number of CPU cores.
-- `drive_size` (Number) Drive size.
-- `drive_type` (String) Drive type.
-- `drive_unit` (String) Drive unit.
-- `location_code` (String) Location country code.
-- `location_name` (String) Location country name.
-- `name` (String) Plan name.
-- `period` (String) Billing period.
+- `category` (String) Plan tier code (e.g. "lite", "medium").
+- `code` (String) Plan code (use this as the `plan` in the ishosting_vps resource). The code encodes the tier, country and billing period (e.g. "29_1m").
+- `cpu` (String) CPU description (e.g. "Xeon 2.90 GHz").
+- `drive` (String) Drive description (e.g. "20GB NVMe").
+- `location_code` (String) ISO country code (e.g. "NL").
+- `location_name` (String) Country name.
+- `name` (String) Plan display name.
+- `os` (String) Default OS code (e.g. "linux/ubuntu22#64").
+- `period` (String) Billing period code (e.g. "1m", "1y").
 - `platform_code` (String) Platform code.
 - `platform_name` (String) Platform name (e.g., Linux, Windows).
-- `price` (Number) Plan price.
-- `ram_size` (Number) RAM size.
-- `ram_unit` (String) RAM unit.
+- `price` (String) Plan price, e.g. "6.99$".
+- `ram` (String) RAM description (e.g. "1 Gb").

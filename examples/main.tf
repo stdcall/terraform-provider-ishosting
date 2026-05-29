@@ -14,12 +14,16 @@ provider "ishosting" {
 
 # ─── Data Sources ───────────────────────────────────────────────
 
-# Look up available VPS plans
-data "ishosting_vps_plans" "all" {}
+# Look up available VPS plans, optionally filtered by ISO country code.
+# Each plan code (e.g. "29_1m") is tied to a single country and billing period.
+data "ishosting_vps_plans" "nl" {
+  locations = ["NL"]
+}
 
-# Look up available configs for a specific plan
+# Look up available configs (OS images, RAM/drive options, control panels,
+# and the per-country plan codes) for a specific plan.
 data "ishosting_vps_configs" "plan_configs" {
-  plan_code = "vps-kvm-lin-1-ber"
+  plan_code = "29_1m"
 }
 
 # ─── SSH Key ────────────────────────────────────────────────────
@@ -32,16 +36,23 @@ resource "ishosting_ssh_key" "my_key" {
 
 # ─── VPS Instance ──────────────────────────────────────────────
 
-# Provision a VPS instance
+# Provision a VPS instance.
+# The plan code fully determines the country, period and base hardware, so there
+# is no separate "location" argument (it is exposed as a computed attribute).
 resource "ishosting_vps" "web_server" {
-  plan     = "vps-kvm-lin-1-ber-1m"
-  location = "ber"
-  name     = "web-server-01"
-  tags     = ["web", "production"]
+  plan = "29_1m" # Netherlands, Lite Linux NVMe, 1 month
+  name = "web-server-01"
+  tags = ["web", "production"]
 
-  # OS selection (use ishosting_vps_configs data source to find codes)
-  os_category = "os_linux_ubuntu"
-  os_code     = "ubuntu_22_04_64"
+  # OS image code (see data.ishosting_vps_configs ... platforms.additions.fixed.os).
+  os = "linux/ubuntu24#64"
+
+  # Optional add-ons: extra RAM, larger drive, extra IPs, control panel, etc.
+  # Codes/categories come from the ishosting_vps_configs data source.
+  additions = [
+    { category = "ram", code = "2g" }, # upgrade to 2 GB RAM
+    { category = "ip", quantity = 1 },  # one extra IPv4
+  ]
 
   # Access settings
   vnc_enabled = false
@@ -51,20 +62,11 @@ resource "ishosting_vps" "web_server" {
   auto_renew = true
 }
 
-# ─── VPS IP Management ─────────────────────────────────────────
+# ─── VPS IPs ───────────────────────────────────────────────────
 
 # Read all IPs assigned to the VPS
 data "ishosting_vps_ips" "web_server_ips" {
   vps_id = ishosting_vps.web_server.id
-}
-
-# Manage the primary IPv4 - set reverse DNS
-resource "ishosting_vps_ip" "web_server_main" {
-  vps_id   = ishosting_vps.web_server.id
-  protocol = "ipv4"
-  address  = ishosting_vps.web_server.public_ip
-  rdns     = "web-server-01.example.com"
-  is_main  = true
 }
 
 # ─── Outputs ───────────────────────────────────────────────────
@@ -81,6 +83,10 @@ output "vps_status" {
   value = ishosting_vps.web_server.status
 }
 
+output "vps_country" {
+  value = ishosting_vps.web_server.location
+}
+
 output "vps_ipv4_addresses" {
   value = data.ishosting_vps_ips.web_server_ips.ipv4
 }
@@ -89,14 +95,22 @@ output "vps_ipv6_addresses" {
   value = data.ishosting_vps_ips.web_server_ips.ipv6
 }
 
+# Per-country plan codes for the selected plan (country -> plan code)
+output "plan_codes_by_country" {
+  value = {
+    for l in data.ishosting_vps_configs.plan_configs.locations : l.code => l.plan
+  }
+}
+
 output "available_plans" {
-  value = [for p in data.ishosting_vps_plans.all.plans : {
+  value = [for p in data.ishosting_vps_plans.nl.plans : {
     code     = p.code
     name     = p.name
     price    = p.price
-    location = p.city_name
-    cpu      = p.cpu_cores
-    ram      = "${p.ram_size} ${p.ram_unit}"
-    drive    = "${p.drive_size} ${p.drive_unit} ${p.drive_type}"
+    country  = p.location_name
+    cpu      = p.cpu
+    ram      = p.ram
+    drive    = p.drive
+    os       = p.os
   }]
 }

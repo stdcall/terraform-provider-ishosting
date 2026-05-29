@@ -3,12 +3,12 @@
 page_title: "ishosting_vps_configs Data Source - ishosting"
 subcategory: ""
 description: |-
-  Retrieves available configuration options for a specific VPS plan. Returns a JSON string containing all available periods, locations, platforms, OS templates, network options, security options, and tools.
+  Retrieves available configuration options for a specific VPS plan. Returns a JSON string containing all available periods, locations, platforms, OS templates, network options, security options, and tools, plus the per-country plan codes as a structured list.
 ---
 
 # ishosting_vps_configs (Data Source)
 
-Retrieves available configuration options for a specific VPS plan. Returns a JSON string containing all available periods, locations, platforms, OS templates, network options, security options, and tools.
+Retrieves available configuration options for a specific VPS plan. Returns a JSON string containing all available periods, locations, platforms, OS templates, network options, security options, and tools, plus the per-country plan codes as a structured list.
 
 
 
@@ -21,4 +21,15 @@ Retrieves available configuration options for a specific VPS plan. Returns a JSO
 
 ### Read-Only
 
-- `config_json` (String) JSON string containing the full configuration options for the plan. Parse this with jsondecode() to access nested values.
+- `config_json` (String) JSON string containing the full configuration options for the plan. Parse this with jsondecode() to access nested values (e.g. platforms.additions.fixed.os for available OS codes).
+- `locations` (Attributes List) Per-country plan codes for this plan. Each country maps to a distinct plan code to use as the `plan` in the ishosting_vps resource. (see [below for nested schema](#nestedatt--locations))
+
+<a id="nestedatt--locations"></a>
+### Nested Schema for `locations`
+
+Read-Only:
+
+- `code` (String) ISO country code (e.g. "NL").
+- `name` (String) Country name.
+- `plan` (String) Plan code for this country (use as the `plan` in ishosting_vps).
+- `price` (String) Price for this country, e.g. "6.99$".

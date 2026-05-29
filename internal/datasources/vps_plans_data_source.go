@@ -27,22 +27,19 @@ type VPSPlansDataSourceModel struct {
 }
 
 type PlanModel struct {
-	Name         types.String  `tfsdk:"name"`
-	Code         types.String  `tfsdk:"code"`
-	Price        types.Float64 `tfsdk:"price"`
-	Period       types.String  `tfsdk:"period"`
-	LocationName types.String  `tfsdk:"location_name"`
-	LocationCode types.String  `tfsdk:"location_code"`
-	CityCode     types.String  `tfsdk:"city_code"`
-	CityName     types.String  `tfsdk:"city_name"`
-	PlatformName types.String  `tfsdk:"platform_name"`
-	PlatformCode types.String  `tfsdk:"platform_code"`
-	CPUCores     types.Int64   `tfsdk:"cpu_cores"`
-	RAMSize      types.Int64   `tfsdk:"ram_size"`
-	RAMUnit      types.String  `tfsdk:"ram_unit"`
-	DriveSize    types.Int64   `tfsdk:"drive_size"`
-	DriveUnit    types.String  `tfsdk:"drive_unit"`
-	DriveType    types.String  `tfsdk:"drive_type"`
+	Code         types.String `tfsdk:"code"`
+	Name         types.String `tfsdk:"name"`
+	Category     types.String `tfsdk:"category"`
+	Price        types.String `tfsdk:"price"`
+	Period       types.String `tfsdk:"period"`
+	LocationName types.String `tfsdk:"location_name"`
+	LocationCode types.String `tfsdk:"location_code"`
+	PlatformName types.String `tfsdk:"platform_name"`
+	PlatformCode types.String `tfsdk:"platform_code"`
+	CPU          types.String `tfsdk:"cpu"`
+	RAM          types.String `tfsdk:"ram"`
+	Drive        types.String `tfsdk:"drive"`
+	OS           types.String `tfsdk:"os"`
 }
 
 func NewVPSPlansDataSource() datasource.DataSource {
@@ -58,12 +55,12 @@ func (d *VPSPlansDataSource) Schema(_ context.Context, _ datasource.SchemaReques
 		Description: "Lists available ISHosting VPS plans.",
 		Attributes: map[string]schema.Attribute{
 			"locations": schema.ListAttribute{
-				Description: "Filter by location codes.",
+				Description: "Filter by ISO country codes (e.g. [\"NL\", \"DE\"]). Each plan is tied to a single country.",
 				Optional:    true,
 				ElementType: types.StringType,
 			},
 			"platforms": schema.ListAttribute{
-				Description: "Filter by platform codes.",
+				Description: "Filter by platform codes (e.g. [\"linux\"]).",
 				Optional:    true,
 				ElementType: types.StringType,
 			},
@@ -72,36 +69,32 @@ func (d *VPSPlansDataSource) Schema(_ context.Context, _ datasource.SchemaReques
 				Computed:    true,
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
-						"name": schema.StringAttribute{
-							Description: "Plan name.",
-							Computed:    true,
-						},
 						"code": schema.StringAttribute{
-							Description: "Plan code (use this in the ishosting_vps resource).",
+							Description: "Plan code (use this as the `plan` in the ishosting_vps resource). The code encodes the tier, country and billing period (e.g. \"29_1m\").",
 							Computed:    true,
 						},
-						"price": schema.Float64Attribute{
-							Description: "Plan price.",
+						"name": schema.StringAttribute{
+							Description: "Plan display name.",
+							Computed:    true,
+						},
+						"category": schema.StringAttribute{
+							Description: "Plan tier code (e.g. \"lite\", \"medium\").",
+							Computed:    true,
+						},
+						"price": schema.StringAttribute{
+							Description: "Plan price, e.g. \"6.99$\".",
 							Computed:    true,
 						},
 						"period": schema.StringAttribute{
-							Description: "Billing period.",
+							Description: "Billing period code (e.g. \"1m\", \"1y\").",
 							Computed:    true,
 						},
 						"location_name": schema.StringAttribute{
-							Description: "Location country name.",
+							Description: "Country name.",
 							Computed:    true,
 						},
 						"location_code": schema.StringAttribute{
-							Description: "Location country code.",
-							Computed:    true,
-						},
-						"city_code": schema.StringAttribute{
-							Description: "City code (use this as the location in the ishosting_vps resource).",
-							Computed:    true,
-						},
-						"city_name": schema.StringAttribute{
-							Description: "City name.",
+							Description: "ISO country code (e.g. \"NL\").",
 							Computed:    true,
 						},
 						"platform_name": schema.StringAttribute{
@@ -112,28 +105,20 @@ func (d *VPSPlansDataSource) Schema(_ context.Context, _ datasource.SchemaReques
 							Description: "Platform code.",
 							Computed:    true,
 						},
-						"cpu_cores": schema.Int64Attribute{
-							Description: "Number of CPU cores.",
+						"cpu": schema.StringAttribute{
+							Description: "CPU description (e.g. \"Xeon 2.90 GHz\").",
 							Computed:    true,
 						},
-						"ram_size": schema.Int64Attribute{
-							Description: "RAM size.",
+						"ram": schema.StringAttribute{
+							Description: "RAM description (e.g. \"1 Gb\").",
 							Computed:    true,
 						},
-						"ram_unit": schema.StringAttribute{
-							Description: "RAM unit.",
+						"drive": schema.StringAttribute{
+							Description: "Drive description (e.g. \"20GB NVMe\").",
 							Computed:    true,
 						},
-						"drive_size": schema.Int64Attribute{
-							Description: "Drive size.",
-							Computed:    true,
-						},
-						"drive_unit": schema.StringAttribute{
-							Description: "Drive unit.",
-							Computed:    true,
-						},
-						"drive_type": schema.StringAttribute{
-							Description: "Drive type.",
+						"os": schema.StringAttribute{
+							Description: "Default OS code (e.g. \"linux/ubuntu22#64\").",
 							Computed:    true,
 						},
 					},
@@ -190,22 +175,19 @@ func (d *VPSPlansDataSource) Read(ctx context.Context, req datasource.ReadReques
 	state.Plans = make([]PlanModel, len(plans))
 	for i, p := range plans {
 		state.Plans[i] = PlanModel{
-			Name:         types.StringValue(p.Name),
-			Code:         types.StringValue(p.Code),
-			Price:        types.Float64Value(p.Price),
-			Period:       types.StringValue(p.Period),
+			Code:         types.StringValue(p.Plan.Code),
+			Name:         types.StringValue(p.Plan.Name),
+			Category:     types.StringValue(p.Plan.Category.Code),
+			Price:        types.StringValue(p.Plan.Price),
+			Period:       types.StringValue(p.Plan.Period.Code),
 			LocationName: types.StringValue(p.Location.Name),
 			LocationCode: types.StringValue(p.Location.Code),
-			CityCode:     types.StringValue(p.Location.Variant.Code),
-			CityName:     types.StringValue(p.Location.Variant.Name),
 			PlatformName: types.StringValue(p.Platform.Name),
 			PlatformCode: types.StringValue(p.Platform.Code),
-			CPUCores:     types.Int64Value(int64(p.Platform.Config.CPU.Cores)),
-			RAMSize:      types.Int64Value(int64(p.Platform.Config.RAM.Size)),
-			RAMUnit:      types.StringValue(p.Platform.Config.RAM.Unit),
-			DriveSize:    types.Int64Value(int64(p.Platform.Config.Drive.Size)),
-			DriveUnit:    types.StringValue(p.Platform.Config.Drive.Unit),
-			DriveType:    types.StringValue(p.Platform.Config.Drive.Type),
+			CPU:          types.StringValue(p.Platform.Config.CPU.Name),
+			RAM:          types.StringValue(p.Platform.Config.RAM.Name),
+			Drive:        types.StringValue(p.Platform.Config.Drive.Name),
+			OS:           types.StringValue(p.Platform.Config.OS.Name),
 		}
 	}
 

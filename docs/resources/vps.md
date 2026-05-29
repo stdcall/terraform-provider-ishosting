@@ -16,17 +16,15 @@ Manages an ISHosting VPS instance.
 
 ### Required
 
-- `location` (String) Location city code (e.g., 'ber' for Berlin). Determined from the plan code.
-- `plan` (String) VPS plan code (e.g., 'vps-kvm-lin-1-ber-1m'). Use the ishosting_vps_plans data source to find available plans.
+- `plan` (String) VPS plan code (e.g., '29_1m'). The code fully determines the country, billing period and base hardware. Use the ishosting_vps_plans data source (or ishosting_vps_configs.locations) to find available plan codes.
 
 ### Optional
 
-- `additions` (Attributes List) Additional configuration options (CPU, RAM, drive, etc.). (see [below for nested schema](#nestedatt--additions))
+- `additions` (Attributes List) Additional configuration options such as extra RAM, larger drive, control panel, or additional IPs. Codes and categories come from the ishosting_vps_configs data source. Changing additions forces replacement. (see [below for nested schema](#nestedatt--additions))
 - `auto_renew` (Boolean) Whether to auto-renew the VPS.
 - `comment` (String) Comment for the order.
 - `name` (String) VPS instance name.
-- `os_category` (String) OS addition category code from plan configs (e.g., 'os_linux_ubuntu').
-- `os_code` (String) OS addition code from plan configs (e.g., 'ubuntu_22_04_64').
+- `os` (String) OS image code from the plan configs (e.g., 'linux/ubuntu24#64', 'linux/debian12#64'). If omitted, the plan's default OS is used. Find available codes via the ishosting_vps_configs data source (platforms.additions.fixed.os).
 - `promos` (List of String) Promo codes to apply.
 - `quantity` (Number) Number of VPS instances to order.
 - `ssh_enabled` (Boolean) Enable SSH access.
@@ -43,6 +41,7 @@ Manages an ISHosting VPS instance.
 - `drive_unit` (String) Drive unit (e.g., GB).
 - `id` (String) VPS instance ID.
 - `invoice_id` (String) Invoice ID from the order. Used to cancel unpaid orders on destroy.
+- `location` (String) ISO country code of the VPS (e.g., 'NL'). Derived from the plan code; this is a read-only computed value.
 - `location_name` (String) Location name.
 - `os_name` (String) Operating system name.
 - `os_version` (String) Operating system version.
@@ -60,5 +59,9 @@ Manages an ISHosting VPS instance.
 
 Required:
 
-- `category` (String) Addition category code.
-- `code` (String) Addition option code.
+- `category` (String) Addition category code (e.g., 'ram', 'disk', 'panel', 'ip').
+
+Optional:
+
+- `code` (String) Addition option code (e.g., '2g' for RAM). Use either code or quantity depending on the category.
+- `quantity` (Number) Quantity for quantity-based additions such as extra IPs (category 'ip').

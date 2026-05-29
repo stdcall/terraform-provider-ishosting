@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -36,8 +37,7 @@ type VPSResourceModel struct {
 	AutoRenew types.Bool   `tfsdk:"auto_renew"`
 
 	// Order options
-	OSCategory types.String `tfsdk:"os_category"`
-	OSCode     types.String `tfsdk:"os_code"`
+	OS         types.String `tfsdk:"os"`
 	VNCEnabled types.Bool   `tfsdk:"vnc_enabled"`
 	SSHEnabled types.Bool   `tfsdk:"ssh_enabled"`
 	SSHKeys    types.List   `tfsdk:"ssh_keys"`
@@ -52,27 +52,28 @@ type VPSResourceModel struct {
 	InvoiceID types.String `tfsdk:"invoice_id"`
 
 	// Computed
-	PublicIP       types.String `tfsdk:"public_ip"`
-	Status         types.String `tfsdk:"status"`
-	State          types.String `tfsdk:"state"`
-	PlatformName   types.String `tfsdk:"platform_name"`
-	CPUCores       types.Int64  `tfsdk:"cpu_cores"`
-	RAMSize        types.Int64  `tfsdk:"ram_size"`
-	RAMUnit        types.String `tfsdk:"ram_unit"`
-	DriveSize      types.Int64  `tfsdk:"drive_size"`
-	DriveUnit      types.String `tfsdk:"drive_unit"`
-	DriveType      types.String `tfsdk:"drive_type"`
-	OSName         types.String `tfsdk:"os_name"`
-	OSVersion      types.String `tfsdk:"os_version"`
-	LocationName   types.String `tfsdk:"location_name"`
-	PlanName       types.String `tfsdk:"plan_name"`
-	PlanPrice      types.Float64 `tfsdk:"plan_price"`
-	CreatedAt      types.String `tfsdk:"created_at"`
+	PublicIP     types.String  `tfsdk:"public_ip"`
+	Status       types.String  `tfsdk:"status"`
+	State        types.String  `tfsdk:"state"`
+	PlatformName types.String  `tfsdk:"platform_name"`
+	CPUCores     types.Int64   `tfsdk:"cpu_cores"`
+	RAMSize      types.Int64   `tfsdk:"ram_size"`
+	RAMUnit      types.String  `tfsdk:"ram_unit"`
+	DriveSize    types.Int64   `tfsdk:"drive_size"`
+	DriveUnit    types.String  `tfsdk:"drive_unit"`
+	DriveType    types.String  `tfsdk:"drive_type"`
+	OSName       types.String  `tfsdk:"os_name"`
+	OSVersion    types.String  `tfsdk:"os_version"`
+	LocationName types.String  `tfsdk:"location_name"`
+	PlanName     types.String  `tfsdk:"plan_name"`
+	PlanPrice    types.Float64 `tfsdk:"plan_price"`
+	CreatedAt    types.String  `tfsdk:"created_at"`
 }
 
 type AdditionModel struct {
 	Code     types.String `tfsdk:"code"`
 	Category types.String `tfsdk:"category"`
+	Quantity types.Int64  `tfsdk:"quantity"`
 }
 
 func NewVPSResource() resource.Resource {
@@ -105,17 +106,17 @@ func (r *VPSResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				ElementType: types.StringType,
 			},
 			"plan": schema.StringAttribute{
-				Description: "VPS plan code (e.g., 'vps-kvm-lin-1-ber-1m'). Use the ishosting_vps_plans data source to find available plans.",
+				Description: "VPS plan code (e.g., '29_1m'). The code fully determines the country, billing period and base hardware. Use the ishosting_vps_plans data source (or ishosting_vps_configs.locations) to find available plan codes.",
 				Required:    true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
 				},
 			},
 			"location": schema.StringAttribute{
-				Description: "Location city code (e.g., 'ber' for Berlin). Determined from the plan code.",
-				Required:    true,
+				Description: "ISO country code of the VPS (e.g., 'NL'). Derived from the plan code; this is a read-only computed value.",
+				Computed:    true,
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
 			"auto_renew": schema.BoolAttribute{
@@ -126,15 +127,8 @@ func (r *VPSResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			},
 
 			// Order options
-			"os_category": schema.StringAttribute{
-				Description: "OS addition category code from plan configs (e.g., 'os_linux_ubuntu').",
-				Optional:    true,
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
-				},
-			},
-			"os_code": schema.StringAttribute{
-				Description: "OS addition code from plan configs (e.g., 'ubuntu_22_04_64').",
+			"os": schema.StringAttribute{
+				Description: "OS image code from the plan configs (e.g., 'linux/ubuntu24#64', 'linux/debian12#64'). If omitted, the plan's default OS is used. Find available codes via the ishosting_vps_configs data source (platforms.additions.fixed.os).",
 				Optional:    true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
@@ -175,17 +169,24 @@ func (r *VPSResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				ElementType: types.StringType,
 			},
 			"additions": schema.ListNestedAttribute{
-				Description: "Additional configuration options (CPU, RAM, drive, etc.).",
+				Description: "Additional configuration options such as extra RAM, larger drive, control panel, or additional IPs. Codes and categories come from the ishosting_vps_configs data source. Changing additions forces replacement.",
 				Optional:    true,
+				PlanModifiers: []planmodifier.List{
+					listplanmodifier.RequiresReplace(),
+				},
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
-						"code": schema.StringAttribute{
-							Description: "Addition option code.",
+						"category": schema.StringAttribute{
+							Description: "Addition category code (e.g., 'ram', 'disk', 'panel', 'ip').",
 							Required:    true,
 						},
-						"category": schema.StringAttribute{
-							Description: "Addition category code.",
-							Required:    true,
+						"code": schema.StringAttribute{
+							Description: "Addition option code (e.g., '2g' for RAM). Use either code or quantity depending on the category.",
+							Optional:    true,
+						},
+						"quantity": schema.Int64Attribute{
+							Description: "Quantity for quantity-based additions such as extra IPs (category 'ip').",
+							Optional:    true,
 						},
 					},
 				},
@@ -195,6 +196,9 @@ func (r *VPSResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"invoice_id": schema.StringAttribute{
 				Description: "Invoice ID from the order. Used to cancel unpaid orders on destroy.",
 				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 
 			// Computed attributes
@@ -290,15 +294,42 @@ func (r *VPSResource) Create(ctx context.Context, req resource.CreateRequest, re
 		return
 	}
 
-	// Build order item
+	// The VPS provisions asynchronously after payment, so computed attributes are
+	// not known at create time. Initialize them to null (a known value) so that no
+	// unknown values remain in state after apply; a later refresh/read populates
+	// them with the real values once the VPS is provisioned.
+	plan.PublicIP = types.StringNull()
+	plan.Status = types.StringNull()
+	plan.State = types.StringNull()
+	plan.Location = types.StringNull()
+	plan.PlatformName = types.StringNull()
+	plan.CPUCores = types.Int64Null()
+	plan.RAMSize = types.Int64Null()
+	plan.RAMUnit = types.StringNull()
+	plan.DriveSize = types.Int64Null()
+	plan.DriveUnit = types.StringNull()
+	plan.DriveType = types.StringNull()
+	plan.OSName = types.StringNull()
+	plan.OSVersion = types.StringNull()
+	plan.LocationName = types.StringNull()
+	plan.PlanName = types.StringNull()
+	plan.PlanPrice = types.Float64Null()
+	plan.CreatedAt = types.StringNull()
+	if plan.Name.IsUnknown() {
+		plan.Name = types.StringNull()
+	}
+
+	// Build order item. The plan code already determines the location, so no
+	// separate location field is sent. Identity correlates the item within the
+	// order, matching the official API client.
 	orderItem := client.OrderItem{
 		Action:   "new",
+		Identity: client.NewOrderIdentity(),
 		Type:     "vps",
 		Plan:     plan.Plan.ValueString(),
 		Quantity: int(plan.Quantity.ValueInt64()),
 		Comment:  plan.Comment.ValueString(),
 	}
-	orderItem.Location.City = plan.Location.ValueString()
 
 	// Options
 	options := &client.OrderOptions{}
@@ -329,18 +360,24 @@ func (r *VPSResource) Create(ctx context.Context, req resource.CreateRequest, re
 			return
 		}
 		for _, a := range additionModels {
-			additions = append(additions, client.OrderAddition{
+			add := client.OrderAddition{
 				Code:     a.Code.ValueString(),
 				Category: a.Category.ValueString(),
-			})
+			}
+			if !a.Quantity.IsNull() {
+				q := int(a.Quantity.ValueInt64())
+				add.Quantity = &q
+			}
+			additions = append(additions, add)
 		}
 	}
 
-	// Add OS if specified
-	if !plan.OSCode.IsNull() && !plan.OSCategory.IsNull() {
+	// Add OS override if specified. The OS category is always "os"; the code is
+	// the full image code (e.g. "linux/ubuntu24#64").
+	if !plan.OS.IsNull() && plan.OS.ValueString() != "" {
 		additions = append(additions, client.OrderAddition{
-			Code:     plan.OSCode.ValueString(),
-			Category: plan.OSCategory.ValueString(),
+			Code:     plan.OS.ValueString(),
+			Category: "os",
 		})
 	}
 
@@ -406,9 +443,11 @@ func (r *VPSResource) Create(ctx context.Context, req resource.CreateRequest, re
 	// Pay the invoice
 	tflog.Debug(ctx, fmt.Sprintf("Paying invoice %s", invoiceResp.ID.String()))
 
+	// Auto-renew for new orders is controlled at payment time via the renew flag,
+	// not via a service edit (which can fail on a pending/unpaid service).
 	payResp, err := r.client.PayInvoice(ctx, invoiceResp.ID.String(), client.PayInvoiceRequest{
 		Balance: true,
-		Renew:   true,
+		Renew:   plan.AutoRenew.ValueBool(),
 	})
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -462,11 +501,13 @@ func (r *VPSResource) Update(ctx context.Context, req resource.UpdateRequest, re
 
 	patchReq := client.VPSPatchRequest{}
 
-	// Update name if changed
-	if !plan.Name.Equal(state.Name) {
-		name := plan.Name.ValueString()
-		patchReq.Name = &name
+	// The API requires `name` on every PATCH, even when it is unchanged
+	// (omitting it returns 400 "should have required property 'name'").
+	name := plan.Name.ValueString()
+	if plan.Name.IsNull() || plan.Name.IsUnknown() {
+		name = state.Name.ValueString()
 	}
+	patchReq.Name = &name
 
 	// Tags are always required by the API in PATCH requests
 	var tags []string
@@ -511,6 +552,10 @@ func (r *VPSResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	}
 
 	r.mapVPSToModel(vps, &plan)
+	// invoice_id is only known at create time and is not part of the VPS read
+	// response, so carry it over from prior state to keep it a known value
+	// (otherwise it stays unknown after apply, which Terraform rejects).
+	plan.InvoiceID = state.InvoiceID
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
@@ -550,6 +595,10 @@ func (r *VPSResource) Delete(ctx context.Context, req resource.DeleteRequest, re
 			AutoRenew: &autoRenew,
 		},
 	}
+
+	// The API requires `name` on every PATCH.
+	name := state.Name.ValueString()
+	patchReq.Name = &name
 
 	// Tags are required in PATCH requests
 	var tags []string

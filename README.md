@@ -124,14 +124,13 @@ export ISHOSTING_API_TOKEN="your-api-token"
 |----------|-------------|
 | `ishosting_vps` | Provision and manage a VPS instance |
 | `ishosting_ssh_key` | Manage SSH keys |
-| `ishosting_vps_ip` | Manage IP address settings (RDNS, main IP) |
 
 ### Data Sources
 
 | Data Source | Description |
 |-------------|-------------|
-| `ishosting_vps_plans` | List available VPS plans |
-| `ishosting_vps_configs` | Get configuration options for a plan |
+| `ishosting_vps_plans` | List available VPS plans (filter by country) |
+| `ishosting_vps_configs` | Get configuration options for a plan, including per-country plan codes |
 | `ishosting_vps_ips` | List all IPs assigned to a VPS |
 
 ---
@@ -158,32 +157,32 @@ resource "ishosting_ssh_key" "default" {
   public_key = file("~/.ssh/id_rsa.pub")
 }
 
-# Browse available plans
-data "ishosting_vps_plans" "all" {}
+# Browse available plans in a country. Each plan code (e.g. "29_1m") is tied to a
+# single country and billing period.
+data "ishosting_vps_plans" "nl" {
+  locations = ["NL"]
+}
 
-# Provision a VPS
+# Provision a VPS. The plan code determines the country, billing period and base
+# hardware, so there is no separate "location" argument.
 resource "ishosting_vps" "web" {
-  plan      = "vps-kvm-lin-1-ber-1m"
-  location  = "ber"
-  name      = "web-01"
-  tags      = ["web", "production"]
+  plan = "29_1m"
+  name = "web-01"
+  tags = ["web", "production"]
 
-  os_category = "os_linux_ubuntu"
-  os_code     = "ubuntu_22_04_64"
+  # OS image code (find available codes via the ishosting_vps_configs data source)
+  os = "linux/ubuntu24#64"
+
+  # Optional add-ons (codes/categories come from ishosting_vps_configs)
+  additions = [
+    { category = "ram", code = "2g" },
+    { category = "ip", quantity = 1 },
+  ]
 
   ssh_enabled = true
   ssh_keys    = [ishosting_ssh_key.default.id]
 
   auto_renew = true
-}
-
-# Set reverse DNS on the main IP
-resource "ishosting_vps_ip" "main" {
-  vps_id   = ishosting_vps.web.id
-  protocol = "ipv4"
-  address  = ishosting_vps.web.public_ip
-  rdns     = "web-01.example.com"
-  is_main  = true
 }
 
 # Read all IPs
@@ -200,10 +199,25 @@ output "all_ipv4" {
 }
 ```
 
-### Import an existing IP
+### Finding plan codes and OS images
 
-```bash
-terraform import ishosting_vps_ip.main <vps_id>/ipv4/<ip_address>
+Plan codes are country-specific. Use the `ishosting_vps_configs` data source to
+discover the plan code for each country and the available OS image codes:
+
+```hcl
+data "ishosting_vps_configs" "lite" {
+  plan_code = "29_1m"
+}
+
+# country code -> plan code
+output "plan_codes_by_country" {
+  value = { for l in data.ishosting_vps_configs.lite.locations : l.code => l.plan }
+}
+
+# available OS image codes (parse the raw config JSON)
+output "os_images" {
+  value = [for o in jsondecode(data.ishosting_vps_configs.lite.config_json).platforms.additions.fixed.os : o.code]
+}
 ```
 
 ---
