@@ -38,6 +38,14 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
+      # Provide Terraform on PATH so tfplugindocs uses it instead of downloading
+      # the binary itself (which fails verification when HashiCorp's embedded
+      # release GPG key has expired: "openpgp: key expired").
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
       - name: Generate docs
         run: go generate ./...
 
