@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"terraform-provider-ishosting/internal/client"
 
@@ -23,6 +24,11 @@ var (
 	_ resource.Resource              = &VPSResource{}
 	_ resource.ResourceWithConfigure = &VPSResource{}
 )
+
+// vpsProvisionTimeout bounds how long Create waits for a freshly ordered VPS to
+// finish provisioning and become active before giving up (and warning rather
+// than failing the apply).
+const vpsProvisionTimeout = 15 * time.Minute
 
 type VPSResource struct {
 	client *client.Client
@@ -294,6 +300,14 @@ func (r *VPSResource) Create(ctx context.Context, req resource.CreateRequest, re
 		return
 	}
 
+	// The order endpoint accepts neither a name nor tags, so capture the
+	// configured values now (before computed fields overwrite them) and apply
+	// them via PATCH after the VPS is created. Without this the API names the
+	// instance after its plan (e.g. "Medium - Linux NVMe"), which loses the
+	// configured name and makes Terraform reject the inconsistent result.
+	configuredName := plan.Name
+	configuredTags := plan.Tags
+
 	// The VPS provisions asynchronously after payment, so computed attributes are
 	// not known at create time. Initialize them to null (a known value) so that no
 	// unknown values remain in state after apply; a later refresh/read populates
@@ -400,10 +414,21 @@ func (r *VPSResource) Create(ctx context.Context, req resource.CreateRequest, re
 
 	tflog.Debug(ctx, "Creating VPS order")
 
-	// Lock the order mutex to ensure only one order (cart) is processed at a time.
-	// Hold the lock until the VPS is active so a concurrent order can't interfere.
+	// The ISHosting API uses a shared cart, so only one order may be in-flight at
+	// a time. Hold the order lock across order creation + payment (the cart
+	// critical section) and release it once the invoice is paid, before waiting
+	// for provisioning, so concurrent VPS creations aren't serialized for the
+	// full activation wait. unlockOrder is idempotent and runs via defer to cover
+	// every early-return error path before payment completes.
 	r.client.LockOrder()
-	defer r.client.UnlockOrder()
+	orderUnlocked := false
+	unlockOrder := func() {
+		if !orderUnlocked {
+			r.client.UnlockOrder()
+			orderUnlocked = true
+		}
+	}
+	defer unlockOrder()
 
 	invoiceResp, err := r.client.CreateOrder(ctx, orderReq)
 	if err != nil {
@@ -458,10 +483,86 @@ func (r *VPSResource) Create(ctx context.Context, req resource.CreateRequest, re
 	}
 
 	tflog.Debug(ctx, fmt.Sprintf("Invoice payment response: %s", string(payResp)))
-	tflog.Debug(ctx, fmt.Sprintf("VPS ordered and paid, ID: %s. VPS will be provisioned shortly.", vpsID))
+	tflog.Debug(ctx, fmt.Sprintf("VPS ordered and paid, ID: %s. Waiting for activation...", vpsID))
 
-	// State is already saved with VPS ID + invoice ID from above.
-	// The VPS will be provisioned asynchronously — run 'terraform refresh' to update computed fields.
+	// The shared cart is finalized once the invoice is paid, so release the order
+	// lock before the (potentially long) provisioning wait.
+	unlockOrder()
+
+	// Wait for the VPS to finish provisioning so computed attributes (public IP,
+	// status, hardware, ...) are populated in state on apply rather than only
+	// after a later refresh.
+	vps, waitErr := r.client.WaitForVPSActive(ctx, vpsID, vpsProvisionTimeout)
+
+	// Apply the configured name/tags via PATCH so the API reflects them (the
+	// order endpoint ignores both). This is best effort: if it is briefly
+	// rejected while the VPS settles we warn and let the next apply reconcile,
+	// since the mapping below already keeps state consistent with the config.
+	hasName := !configuredName.IsNull() && !configuredName.IsUnknown()
+	hasTags := !configuredTags.IsNull() && !configuredTags.IsUnknown()
+	if (hasName || hasTags) && vps != nil {
+		// The API requires `name` on every PATCH, so fall back to the current name.
+		patchName := vps.Name
+		if hasName {
+			patchName = configuredName.ValueString()
+		}
+		var patchTags []string
+		if hasTags {
+			resp.Diagnostics.Append(configuredTags.ElementsAs(ctx, &patchTags, false)...)
+		}
+		if patchTags == nil {
+			patchTags = []string{}
+		}
+		if _, perr := r.client.UpdateVPS(ctx, vpsID, client.VPSPatchRequest{Name: &patchName, Tags: patchTags}); perr != nil {
+			resp.Diagnostics.AddWarning(
+				"Could Not Set VPS Name/Tags",
+				fmt.Sprintf("VPS %s was created but its name/tags could not be applied yet: %s. "+
+					"They will be reconciled on the next apply.", vpsID, perr.Error()),
+			)
+		}
+	}
+
+	if waitErr != nil {
+		// Persist whatever the API already knows (the wait returns the last
+		// observed VPS even on timeout) so the resource stays tracked and can be
+		// refreshed or destroyed, then warn instead of failing the apply.
+		if vps != nil {
+			r.mapVPSToModel(vps, &plan)
+		}
+		preserveConfiguredNameAndTags(&plan, configuredName, configuredTags)
+		plan.ID = types.StringValue(vpsID)
+		plan.InvoiceID = types.StringValue(invoiceResp.ID.String())
+		resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+		resp.Diagnostics.AddWarning(
+			"VPS Not Yet Active",
+			fmt.Sprintf("VPS %s was ordered and paid but did not reach an active state: %s. "+
+				"Run 'terraform refresh' once it has finished provisioning.", vpsID, waitErr.Error()),
+		)
+		return
+	}
+
+	// Populate computed attributes from the provisioned VPS, keeping the
+	// configured name/tags so the applied state matches the plan.
+	r.mapVPSToModel(vps, &plan)
+	preserveConfiguredNameAndTags(&plan, configuredName, configuredTags)
+	plan.InvoiceID = types.StringValue(invoiceResp.ID.String())
+	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+
+	tflog.Debug(ctx, fmt.Sprintf("VPS %s is active", vpsID))
+}
+
+// preserveConfiguredNameAndTags keeps the user-configured name/tags in the
+// model so the applied value matches the plan (Terraform rejects a result that
+// differs from a configured value). name is Optional+Computed, so the
+// API-assigned value is kept only when the user did not set one; tags is a
+// plain Optional list and mirrors the configuration whenever it is known.
+func preserveConfiguredNameAndTags(model *VPSResourceModel, name types.String, tags types.List) {
+	if !name.IsNull() && !name.IsUnknown() {
+		model.Name = name
+	}
+	if !tags.IsUnknown() {
+		model.Tags = tags
+	}
 }
 
 func (r *VPSResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {

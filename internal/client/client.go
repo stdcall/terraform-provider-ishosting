@@ -13,6 +13,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,12 +25,35 @@ import (
 
 const defaultBaseURL = "https://api.ishosting.com"
 
+const (
+	// defaultMinRequestInterval is the minimum spacing enforced between API
+	// requests. The API rejects bursts with HTTP 429 ("Allowed no more than 1
+	// request(s) in 10 seconds"), so all requests are throttled to at most one
+	// per this interval. Override with the ISHOSTING_MIN_REQUEST_INTERVAL
+	// environment variable (a Go duration such as "5s"; "0s" disables proactive
+	// throttling and relies solely on 429 retries).
+	defaultMinRequestInterval = 10 * time.Second
+
+	// defaultMaxRetries bounds how many times a request is retried after a 429
+	// response before giving up. Override with ISHOSTING_MAX_RETRIES.
+	defaultMaxRetries = 5
+)
+
 // Client is the ISHosting API client.
 type Client struct {
 	BaseURL    string
 	APIToken   string
 	HTTPClient *http.Client
 	orderMu    sync.Mutex // serializes orders since the API uses a shared cart
+
+	// Rate limiting. The API permits only a small number of requests per window
+	// (responding with HTTP 429 and a retry_after hint otherwise), so every
+	// request is spaced at least minInterval apart across goroutines (via
+	// nextAllowed) and retried up to maxRetries times on a 429.
+	rateMu      sync.Mutex
+	nextAllowed time.Time
+	minInterval time.Duration
+	maxRetries  int
 }
 
 // newUTLSTransport creates an HTTP/2 transport using uTLS with a Chrome TLS fingerprint
@@ -72,7 +98,108 @@ func NewClient(apiToken, baseURL string) *Client {
 			Transport: newUTLSTransport(),
 			Timeout:   120 * time.Second,
 		},
+		minInterval: envDuration("ISHOSTING_MIN_REQUEST_INTERVAL", defaultMinRequestInterval),
+		maxRetries:  envInt("ISHOSTING_MAX_RETRIES", defaultMaxRetries),
 	}
+}
+
+// envDuration reads a Go duration from the named environment variable, falling
+// back to def when unset or invalid.
+func envDuration(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+		return d
+	}
+	log.Printf("[WARN] invalid %s=%q; using default %s", key, v, def)
+	return def
+}
+
+// envInt reads a non-negative integer from the named environment variable,
+// falling back to def when unset or invalid.
+func envInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+		return n
+	}
+	log.Printf("[WARN] invalid %s=%q; using default %d", key, v, def)
+	return def
+}
+
+// reserveSlot blocks until this request's throttling slot is reached, spacing
+// successive requests at least minInterval apart across all goroutines. It
+// returns early if the context is cancelled.
+func (c *Client) reserveSlot(ctx context.Context) error {
+	c.rateMu.Lock()
+	now := time.Now()
+	slot := now
+	if c.nextAllowed.After(now) {
+		slot = c.nextAllowed
+	}
+	if c.minInterval > 0 {
+		c.nextAllowed = slot.Add(c.minInterval)
+	} else {
+		c.nextAllowed = slot
+	}
+	c.rateMu.Unlock()
+
+	delay := time.Until(slot)
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// backoffFor pushes the next allowed request time out by at least d, so that
+// after a 429 every subsequent request (across goroutines) waits for the
+// rate-limit window to clear rather than hammering the API in lockstep.
+func (c *Client) backoffFor(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.rateMu.Lock()
+	if t := time.Now().Add(d); t.After(c.nextAllowed) {
+		c.nextAllowed = t
+	}
+	c.rateMu.Unlock()
+}
+
+// retryAfterFromResponse determines how long to wait before retrying a
+// rate-limited (429) request, preferring the standard Retry-After header and
+// falling back to the API's JSON body ({"data":{"retry_after":N}}). It returns
+// 0 when no hint is available.
+func retryAfterFromResponse(header http.Header, body []byte) time.Duration {
+	if v := strings.TrimSpace(header.Get("Retry-After")); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			return time.Duration(secs) * time.Second
+		}
+		if t, err := http.ParseTime(v); err == nil {
+			if d := time.Until(t); d > 0 {
+				return d
+			}
+		}
+	}
+	var parsed struct {
+		Data struct {
+			RetryAfter float64 `json:"retry_after"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil && parsed.Data.RetryAfter > 0 {
+		return time.Duration(parsed.Data.RetryAfter * float64(time.Second))
+	}
+	return 0
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, body interface{}, query url.Values) ([]byte, error) {
@@ -81,7 +208,6 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 		u = fmt.Sprintf("%s?%s", u, query.Encode())
 	}
 
-	var reqBody io.Reader
 	var jsonBody []byte
 	if body != nil {
 		var err error
@@ -89,7 +215,6 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 		if err != nil {
 			return nil, fmt.Errorf("marshaling request body: %w", err)
 		}
-		reqBody = bytes.NewBuffer(jsonBody)
 	}
 
 	log.Printf("[DEBUG] ISHosting API Request: %s %s", method, u)
@@ -97,35 +222,75 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 		log.Printf("[DEBUG] Request Body: %s", string(jsonBody))
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, u, reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		// Throttle outgoing requests so we stay under the API's rate limit and
+		// so concurrent requests (e.g. parallel resource creation) are spaced
+		// out instead of colliding.
+		if err := c.reserveSlot(ctx); err != nil {
+			return nil, err
+		}
+
+		var reqBody io.Reader
+		if jsonBody != nil {
+			reqBody = bytes.NewReader(jsonBody)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, method, u, reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("creating request: %w", err)
+		}
+
+		req.Header.Set("X-Api-Token", c.APIToken)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+		resp, err := c.HTTPClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("executing request: %w", err)
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("reading response body: %w", err)
+		}
+
+		log.Printf("[DEBUG] ISHosting API Response: %s %s -> %d", method, u, resp.StatusCode)
+		log.Printf("[DEBUG] Response Body: %s", string(respBody))
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			wait := retryAfterFromResponse(resp.Header, respBody)
+			if wait <= 0 {
+				wait = c.minInterval
+			}
+			if wait <= 0 {
+				wait = defaultMinRequestInterval
+			}
+			// Back off globally so other in-flight requests also wait for the
+			// window to clear before retrying.
+			c.backoffFor(wait)
+			lastErr = fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
+			if attempt < c.maxRetries {
+				log.Printf("[WARN] ISHosting API rate limited (429) on %s %s; backing off ~%s then retrying (attempt %d/%d)",
+					method, u, wait.Round(time.Second), attempt+1, c.maxRetries)
+				continue
+			}
+			return nil, fmt.Errorf("rate limited after %d retries: %w", c.maxRetries, lastErr)
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
+		}
+
+		return respBody, nil
 	}
 
-	req.Header.Set("X-Api-Token", c.APIToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("executing request: %w", err)
+	if lastErr != nil {
+		return nil, lastErr
 	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading response body: %w", err)
-	}
-
-	log.Printf("[DEBUG] ISHosting API Response: %s %s -> %d", method, u, resp.StatusCode)
-	log.Printf("[DEBUG] Response Body: %s", string(respBody))
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
-	}
-
-	return respBody, nil
+	return nil, fmt.Errorf("request to %s %s failed after %d attempts", method, u, c.maxRetries+1)
 }
 
 // --- VPS Operations ---
@@ -235,9 +400,14 @@ func (c *Client) GetVPS(ctx context.Context, id string) (*VPS, error) {
 }
 
 // VPSPatchRequest represents the PATCH request body for updating a VPS.
+//
+// The API treats name and tags as required on every PATCH (omitting name
+// returns 400 "should have required property 'name'"), so Tags has no
+// omitempty: a cleared list must be sent as an explicit empty array rather than
+// dropped. Callers always set Tags to a non-nil slice.
 type VPSPatchRequest struct {
 	Name *string  `json:"name,omitempty"`
-	Tags []string `json:"tags,omitempty"`
+	Tags []string `json:"tags"`
 	Plan *struct {
 		AutoRenew *bool `json:"auto_renew,omitempty"`
 	} `json:"plan,omitempty"`
@@ -378,22 +548,76 @@ func (c *Client) CancelInvoice(ctx context.Context, invoiceID string) error {
 	return err
 }
 
-// WaitForVPSActive polls until the VPS reaches an active state or times out.
+// vpsPollInterval is how often WaitForVPSActive re-checks the VPS while it
+// provisions.
+const vpsPollInterval = 10 * time.Second
+
+// vpsIsReady reports whether a provisioning VPS has finished and is usable.
+// The live API returns lowercase status codes ("activating" -> "running") and
+// capitalized state codes ("Ordered" -> "Active"), so matching is
+// case-insensitive to tolerate either convention.
+func vpsIsReady(vps *VPS) bool {
+	return strings.EqualFold(vps.Status.Code, "running") ||
+		strings.EqualFold(vps.Status.State.Code, "active")
+}
+
+// vpsFailureReason returns a non-empty reason when the VPS has entered a
+// terminal state from which it will never become active, so polling can stop
+// early instead of waiting for the full timeout.
+func vpsFailureReason(vps *VPS) string {
+	codes := []string{vps.Status.Code, vps.Status.State.Code}
+	for _, code := range codes {
+		switch {
+		case strings.EqualFold(code, "rejected"):
+			return "rejected"
+		case strings.EqualFold(code, "cancelled"), strings.EqualFold(code, "canceled"):
+			return "cancelled"
+		case strings.EqualFold(code, "terminated"):
+			return "terminated"
+		}
+	}
+	return ""
+}
+
+// WaitForVPSActive polls GET /vps/{id} until the VPS becomes active/running,
+// enters a terminal failure state, or the timeout elapses. The most recently
+// fetched VPS is always returned (including on timeout) so callers can persist
+// whatever fields are already known. Transient fetch errors (e.g. a brief 404
+// right after ordering) are logged and retried rather than aborting the wait.
 func (c *Client) WaitForVPSActive(ctx context.Context, id string, timeout time.Duration) (*VPS, error) {
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	var last *VPS
+	for {
 		vps, err := c.GetVPS(ctx, id)
-		if err == nil && (vps.Status.Code == "running" || vps.Status.State.Code == "Active") {
-			return vps, nil
+		if err != nil {
+			log.Printf("[DEBUG] polling VPS %s (will retry): %v", id, err)
+		} else {
+			last = vps
+			if vpsIsReady(vps) {
+				return vps, nil
+			}
+			if reason := vpsFailureReason(vps); reason != "" {
+				return vps, fmt.Errorf("VPS %s entered terminal state %q (status=%q, state=%q)",
+					id, reason, vps.Status.Code, vps.Status.State.Code)
+			}
+		}
+
+		if !time.Now().Before(deadline) {
+			statusCode, stateCode := "unknown", "unknown"
+			if last != nil {
+				statusCode = last.Status.Code
+				stateCode = last.Status.State.Code
+			}
+			return last, fmt.Errorf("timeout waiting for VPS %s to become active after %s (last status=%q, state=%q)",
+				id, timeout, statusCode, stateCode)
 		}
 
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(10 * time.Second):
+			return last, ctx.Err()
+		case <-time.After(vpsPollInterval):
 		}
 	}
-	return nil, fmt.Errorf("timeout waiting for VPS %s to become active", id)
 }
 
 // --- SSH Key Operations ---
