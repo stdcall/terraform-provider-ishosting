@@ -6,6 +6,7 @@ import (
 
 	"terraform-provider-ishosting/internal/client"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
@@ -14,8 +15,9 @@ import (
 )
 
 var (
-	_ resource.Resource              = &SSHKeyResource{}
-	_ resource.ResourceWithConfigure = &SSHKeyResource{}
+	_ resource.Resource                = &SSHKeyResource{}
+	_ resource.ResourceWithConfigure   = &SSHKeyResource{}
+	_ resource.ResourceWithImportState = &SSHKeyResource{}
 )
 
 type SSHKeyResource struct {
@@ -85,6 +87,12 @@ func (r *SSHKeyResource) Configure(_ context.Context, req resource.ConfigureRequ
 	}
 
 	r.client = c
+}
+
+// ImportState lets `terraform import ishosting_ssh_key.<addr> <key-id>` adopt
+// an existing account SSH key into state by its ID.
+func (r *SSHKeyResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 
 func (r *SSHKeyResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {

@@ -96,6 +96,7 @@ func (p *IsHostingProvider) Resources(_ context.Context) []func() resource.Resou
 	return []func() resource.Resource{
 		resources.NewVPSResource,
 		resources.NewSSHKeyResource,
+		resources.NewVPSReinstallResource,
 	}
 }
 
