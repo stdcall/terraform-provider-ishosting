@@ -9,6 +9,7 @@ import (
 
 	"terraform-provider-ishosting/internal/client"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
@@ -22,8 +23,9 @@ import (
 )
 
 var (
-	_ resource.Resource              = &VPSResource{}
-	_ resource.ResourceWithConfigure = &VPSResource{}
+	_ resource.Resource                = &VPSResource{}
+	_ resource.ResourceWithConfigure   = &VPSResource{}
+	_ resource.ResourceWithImportState = &VPSResource{}
 )
 
 // vpsProvisionTimeout bounds how long Create waits for a freshly ordered VPS to
@@ -47,7 +49,7 @@ type VPSResourceModel struct {
 	OS         types.String `tfsdk:"os"`
 	VNCEnabled types.Bool   `tfsdk:"vnc_enabled"`
 	SSHEnabled types.Bool   `tfsdk:"ssh_enabled"`
-	SSHKeys    types.List   `tfsdk:"ssh_keys"`
+	SSHKeys    types.Set    `tfsdk:"ssh_keys"`
 	Quantity   types.Int64  `tfsdk:"quantity"`
 	Comment    types.String `tfsdk:"comment"`
 	Promos     types.List   `tfsdk:"promos"`
@@ -153,8 +155,8 @@ func (r *VPSResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				Computed:    true,
 				Default:     booldefault.StaticBool(true),
 			},
-			"ssh_keys": schema.ListAttribute{
-				Description: "List of SSH key IDs to attach.",
+			"ssh_keys": schema.SetAttribute{
+				Description: "Set of SSH key IDs to attach to the VPS.",
 				Optional:    true,
 				ElementType: types.StringType,
 			},
@@ -292,6 +294,12 @@ func (r *VPSResource) Configure(_ context.Context, req resource.ConfigureRequest
 	}
 
 	r.client = c
+}
+
+// ImportState lets `terraform import ishosting_vps.<addr> <vps-id>` adopt an
+// existing VPS into state by its ID; Read() then fills the rest from the API.
+func (r *VPSResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 
 func (r *VPSResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -589,6 +597,7 @@ func (r *VPSResource) Read(ctx context.Context, req resource.ReadRequest, resp *
 	}
 
 	r.mapVPSToModel(vps, &state)
+	state.SSHKeys = sshKeyIDsAttached(vps)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -611,20 +620,20 @@ func (r *VPSResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	}
 	patchReq.Name = &name
 
-	// Tags are always required by the API in PATCH requests
 	var tags []string
-	if !plan.Tags.IsNull() {
+	if !plan.Tags.IsNull() && !plan.Tags.IsUnknown() {
 		resp.Diagnostics.Append(plan.Tags.ElementsAs(ctx, &tags, false)...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
+	} else if !state.Tags.IsNull() {
+		state.Tags.ElementsAs(ctx, &tags, false)
 	}
 	if tags == nil {
 		tags = []string{}
 	}
 	patchReq.Tags = tags
 
-	// Update auto_renew if changed
 	if !plan.AutoRenew.Equal(state.AutoRenew) {
 		autoRenew := plan.AutoRenew.ValueBool()
 		patchReq.Plan = &struct {
@@ -651,6 +660,38 @@ func (r *VPSResource) Update(ctx context.Context, req resource.UpdateRequest, re
 			"Could not read VPS "+state.ID.ValueString()+": "+err.Error(),
 		)
 		return
+	}
+
+	// SSH key attachment: if the desired set changed, push it via
+	// PATCH /vps/{id}/access/ssh. That endpoint replaces the whole SSH block,
+	// so we re-send the VPS's current `users` (from the read above) to preserve
+	// them. On infected nodes this only updates ISHosting's account record —
+	// real SSH access is governed by the installed OS (e.g. NixOS authorized_keys).
+	if !plan.SSHKeys.Equal(state.SSHKeys) {
+		var keys []string
+		if !plan.SSHKeys.IsNull() && !plan.SSHKeys.IsUnknown() {
+			resp.Diagnostics.Append(plan.SSHKeys.ElementsAs(ctx, &keys, false)...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+		}
+		if keys == nil {
+			keys = []string{}
+		}
+		var users []client.SSHUser
+		if vps.Access.SSH != nil {
+			users = vps.Access.SSH.Users
+		}
+		if err := r.client.UpdateVPSSSHAccess(ctx, state.ID.ValueString(), client.SSHAccessPatchRequest{
+			Users: users,
+			Keys:  keys,
+		}); err != nil {
+			resp.Diagnostics.AddError(
+				"Error Updating VPS SSH Access",
+				"Could not update SSH keys for VPS "+state.ID.ValueString()+": "+err.Error(),
+			)
+			return
+		}
 	}
 
 	r.mapVPSToModel(vps, &plan)
@@ -786,4 +827,20 @@ func parsePrice(s string) float64 {
 		return 0
 	}
 	return n
+}
+
+// sshKeyIDsAttached returns the SSH key IDs currently attached to the VPS
+// (access.ssh.keys) as a Set, so Read can populate ssh_keys and terraform
+// tracks the attachment instead of ignoring it. A Set (not List) is used so
+// key order from the API doesn't produce spurious diffs.
+func sshKeyIDsAttached(vps *client.VPS) types.Set {
+	if vps.Access.SSH == nil {
+		return types.SetNull(types.StringType)
+	}
+	ids := make([]string, 0, len(vps.Access.SSH.Keys))
+	for _, k := range vps.Access.SSH.Keys {
+		ids = append(ids, k.ID)
+	}
+	set, _ := types.SetValueFrom(context.Background(), types.StringType, ids)
+	return set
 }

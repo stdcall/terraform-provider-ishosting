@@ -686,6 +686,21 @@ func (c *Client) DeleteSSHKey(ctx context.Context, id string) error {
 	return err
 }
 
+// SSHAccessPatchRequest — body for PATCH /vps/{id}/access/ssh. The API
+// replaces the whole SSH-access block, so callers must include the current
+// `users` to preserve them (omitting them would drop the OS users). `keys` is
+// the full set of SSH key IDs to attach.
+type SSHAccessPatchRequest struct {
+	Users []SSHUser `json:"users"`
+	Keys  []string  `json:"keys"`
+}
+
+// UpdateVPSSSHAccess sets the SSH key IDs (and users) attached to a VPS.
+func (c *Client) UpdateVPSSSHAccess(ctx context.Context, id string, req SSHAccessPatchRequest) error {
+	_, err := c.doRequest(ctx, http.MethodPatch, fmt.Sprintf("/vps/%s/access/ssh", id), req, nil)
+	return err
+}
+
 // --- VPS IP Operations ---
 
 // IPPatchRequest represents the request to update an IP address.
@@ -867,4 +882,48 @@ func ParseConfigLocations(raw json.RawMessage) ([]VPSConfigLocation, error) {
 		return nil, fmt.Errorf("parsing VPS configs locations: %w", err)
 	}
 	return parsed.Locations, nil
+}
+
+// --- VPS OS Reinstall ---
+
+// VPSReinstallSSHUser is the per-user payload accepted by
+// PATCH /vps/{id}/os under the optional `ssh.users` field.
+type VPSReinstallSSHUser struct {
+	Username  string `json:"username"`
+	IsEnabled bool   `json:"is_enabled"`
+}
+
+// VPSReinstallSSH wraps the SSH access seeded into the freshly
+// reinstalled OS (panel-side; the API takes them as the new install's
+// authorized_keys + user list).
+type VPSReinstallSSH struct {
+	Users []VPSReinstallSSHUser `json:"users,omitempty"`
+	Keys  []string              `json:"keys,omitempty"`
+}
+
+// VPSReinstallRequest mirrors the body accepted by PATCH /vps/{id}/os.
+// The API is destructive — every block of the running OS is wiped and
+// the freshly chosen image boots in its place. There is no
+// "queue-only" preview; every accepted call triggers a real reinstall.
+type VPSReinstallRequest struct {
+	OS struct {
+		Code string `json:"code"`
+	} `json:"os"`
+	SSH *VPSReinstallSSH `json:"ssh,omitempty"`
+}
+
+// ReinstallVPSOS triggers OS reinstall of an existing VPS. The VPS id
+// + reserved IP address survive; everything on disk is replaced.
+func (c *Client) ReinstallVPSOS(ctx context.Context, id string, req VPSReinstallRequest) (*VPS, error) {
+	respBody, err := c.doRequest(ctx, http.MethodPatch, fmt.Sprintf("/vps/%s/os", id), req, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var vps VPS
+	if err := json.Unmarshal(respBody, &vps); err != nil {
+		return nil, fmt.Errorf("unmarshaling VPS reinstall response: %w", err)
+	}
+
+	return &vps, nil
 }
